@@ -933,7 +933,16 @@ def interactive_config() -> Config:
 # 主函数
 # ============================================================
 def main() -> None:
-    cfg = interactive_config()
+    import sys
+    interactive = len(sys.argv) > 1 and sys.argv[1] == "--interactive"
+    
+    if interactive:
+        cfg = interactive_config()
+    else:
+        print("使用默认配置运行（非交互模式）")
+        print("使用 --interactive 参数启动交互式配置")
+        cfg = Config()
+        cfg.show_plots = True
     
     print_config(cfg)
     np.random.seed(cfg.random_seed)
