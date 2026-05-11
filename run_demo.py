@@ -64,25 +64,18 @@ dates = pd.date_range(cfg.start_date, cfg.end_date, freq='B')
 n_days = len(dates)
 n_assets = cfg.n_assets
 
-# 模拟真实市场特征
-rng_data = np.random.default_rng(42)
-corr_matrix = rng_data.random((n_assets, n_assets))
-corr_matrix = (corr_matrix + corr_matrix.T) / 2
-np.fill_diagonal(corr_matrix, 1.0)
-eigenvals = np.array([1.0, 0.6, 0.4, 0.3] + [0.15] * (n_assets - 4))
-cov_matrix = (rng_data.standard_normal((n_assets, n_assets)) * 
-              np.sqrt(eigenvals[:, None]) * np.sqrt(eigenvals[None, :]))
-cov_matrix = cov_matrix @ corr_matrix @ cov_matrix.T * 0.0004
+# 生成相关收益率矩阵
+cov_matrix = np.random.randn(n_assets, n_assets) * 0.15
+cov_matrix = cov_matrix @ cov_matrix.T * 0.0001
 np.fill_diagonal(cov_matrix, 0.0004)
-mean_returns = rng_data.normal(0.0003, 0.0001, n_assets)
+mean_returns = np.full(n_assets, 0.0003)
 
-returns_raw = rng_data.multivariate_normal(mean_returns, cov_matrix, n_days)
+returns_raw = np.random.multivariate_normal(mean_returns, cov_matrix, n_days)
 returns_df = pd.DataFrame(returns_raw, index=dates, 
                           columns=[f'Stock_{i:02d}' for i in range(n_assets)])
 returns_df = returns_df.clip(-0.1, 0.1)
 
 print(f"生成数据: {n_days}个交易日, {n_assets}只股票")
-print(f"平均日收益: {returns_df.mean().mean()*100:.4f}%, 平均波动: {returns_df.std().mean()*100:.4f}%")
 
 # 股票名称
 stock_names = {
