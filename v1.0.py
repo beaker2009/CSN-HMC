@@ -786,14 +786,15 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     rebalance_weight_eq = w_eq.loc[rebalance_dates].dropna(how='all')
     
     # 计算调仓日的权重变化
-    weight_change_csn = rebalance_weight_csn.diff().abs().sum(axis=1).fillna(0.0)
-    weight_change_mv = rebalance_weight_mv.diff().abs().sum(axis=1).fillna(0.0)
-    weight_change_eq = rebalance_weight_eq.diff().abs().sum(axis=1).fillna(0.0)
+    # 换手率 = 0.5 × |w_new - w_old| 的绝对值之和
+    weight_change_csn = 0.5 * rebalance_weight_csn.diff().abs().sum(axis=1).fillna(0.0)
+    weight_change_mv = 0.5 * rebalance_weight_mv.diff().abs().sum(axis=1).fillna(0.0)
+    weight_change_eq = 0.5 * rebalance_weight_eq.diff().abs().sum(axis=1).fillna(0.0)
     
     # 将权重变化映射回完整的日期序列（交易成本在调仓日之后的第一个交易日扣除）
-    tc_csn = pd.Series(0.0, index=dates)
-    tc_mv = pd.Series(0.0, index=dates)
-    tc_eq = pd.Series(0.0, index=dates)
+    turnover_csn = pd.Series(0.0, index=dates)
+    turnover_mv = pd.Series(0.0, index=dates)
+    turnover_eq = pd.Series(0.0, index=dates)
     
     for idx, date in enumerate(rebalance_dates):
         if idx == 0:
@@ -801,16 +802,11 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
         next_pos = _next_trading_position(dates, date)
         if next_pos < len(dates):
             next_date = dates[next_pos]
-            if next_date in tc_csn.index:
-                tc_csn.loc[next_date] = weight_change_csn.get(date, 0.0)
-                tc_mv.loc[next_date] = weight_change_mv.get(date, 0.0)
-                tc_eq.loc[next_date] = weight_change_eq.get(date, 0.0)
+            if next_date in turnover_csn.index:
+                turnover_csn.loc[next_date] = weight_change_csn.get(date, 0.0)
+                turnover_mv.loc[next_date] = weight_change_mv.get(date, 0.0)
+                turnover_eq.loc[next_date] = weight_change_eq.get(date, 0.0)
     
-    # 应用交易成本系数
-    tc_csn = cfg.transaction_cost * tc_csn
-    tc_mv = cfg.transaction_cost * tc_mv
-    tc_eq = cfg.transaction_cost * tc_eq
-
     # 计算组合收益（使用滞后一期的权重）
     lag_csn = w_csn.shift(1).bfill()
     lag_mv = w_mv.shift(1).bfill()
@@ -820,19 +816,36 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     gross_mv = (returns_df * lag_mv).sum(axis=1)
     gross_eq = (returns_df * lag_eq).sum(axis=1)
 
-    net_csn = gross_csn - tc_csn
-    net_mv = gross_mv - tc_mv
-    net_eq = gross_eq - tc_eq
+    # 正确的复利计算：交易成本按比例减少资金
+    # 
+    # 交易过程：
+    # 1. 调仓日收盘后：资金变为 1 × (1 - turnover × cost)
+    # 2. 次日开始用剩余资金投资
+    # 3. 次日收益：剩余资金 × (1 + 日收益率)
+    #
+    # 正确公式：
+    # value_t = value_{t-1} × (1 + r_t) × (1 - turnover_{t-1} × cost)
+    #
+    # 日收益因子 = (1 + gross_return) × (1 - turnover × cost_rate)
+    
+    # 日收益因子（考虑交易成本）
+    daily_factor_csn = (1.0 + gross_csn) * (1.0 - turnover_csn * cfg.transaction_cost)
+    daily_factor_mv = (1.0 + gross_mv) * (1.0 - turnover_mv * cfg.transaction_cost)
+    daily_factor_eq = (1.0 + gross_eq) * (1.0 - turnover_eq * cfg.transaction_cost)
 
-    curves = {
-        "CSN-HMC": (1.0 + net_csn).cumprod(),
-        "MV": (1.0 + net_mv).cumprod(),
-        "EW": (1.0 + net_eq).cumprod(),
-    }
+    # 净值曲线（从索引1开始累积，索引0为初始资金1.0）
+    curves = {}
+    for name, factor in [("CSN-HMC", daily_factor_csn), ("MV", daily_factor_mv), ("EW", daily_factor_eq)]:
+        cumprod_series = pd.Series(1.0, index=factor.index)
+        for i in range(1, len(factor)):
+            cumprod_series.iloc[i] = cumprod_series.iloc[i-1] * factor.iloc[i]
+        curves[name] = cumprod_series
+    
+    # 日收益率
     dailies = {
-        "CSN-HMC": net_csn,
-        "MV": net_mv,
-        "EW": net_eq,
+        "CSN-HMC": daily_factor_csn - 1.0,
+        "MV": daily_factor_mv - 1.0,
+        "EW": daily_factor_eq - 1.0,
     }
 
     diag_df = pd.DataFrame(diag_rows).set_index("rebalance_date")
