@@ -678,6 +678,7 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
             **{f"EW_{c}": eq_w[i] for i, c in enumerate(assets)},
         })
 
+    # 填充权重数据
     for df in (w_csn, w_mv, w_eq):
         first_valid = df.dropna().index.min()
         if pd.notna(first_valid):
@@ -687,6 +688,39 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
         else:
             df.iloc[:, :] = equal_weight_portfolio(d)
 
+    # 构建用于计算交易成本的权重序列（仅包含调仓日的权重变化）
+    # 首先提取调仓日的权重
+    rebalance_weight_csn = w_csn.loc[rebalance_dates].dropna(how='all')
+    rebalance_weight_mv = w_mv.loc[rebalance_dates].dropna(how='all')
+    rebalance_weight_eq = w_eq.loc[rebalance_dates].dropna(how='all')
+    
+    # 计算调仓日的权重变化
+    weight_change_csn = rebalance_weight_csn.diff().abs().sum(axis=1).fillna(0.0)
+    weight_change_mv = rebalance_weight_mv.diff().abs().sum(axis=1).fillna(0.0)
+    weight_change_eq = rebalance_weight_eq.diff().abs().sum(axis=1).fillna(0.0)
+    
+    # 将权重变化映射回完整的日期序列（交易成本在调仓日之后的第一个交易日扣除）
+    tc_csn = pd.Series(0.0, index=dates)
+    tc_mv = pd.Series(0.0, index=dates)
+    tc_eq = pd.Series(0.0, index=dates)
+    
+    for idx, date in enumerate(rebalance_dates):
+        if idx == 0:
+            continue  # 第一个调仓日没有前序权重，不计算交易成本
+        next_pos = _next_trading_position(dates, date)
+        if next_pos < len(dates):
+            next_date = dates[next_pos]
+            if next_date in tc_csn.index:
+                tc_csn.loc[next_date] = weight_change_csn.get(date, 0.0)
+                tc_mv.loc[next_date] = weight_change_mv.get(date, 0.0)
+                tc_eq.loc[next_date] = weight_change_eq.get(date, 0.0)
+    
+    # 应用交易成本系数
+    tc_csn = cfg.transaction_cost * tc_csn
+    tc_mv = cfg.transaction_cost * tc_mv
+    tc_eq = cfg.transaction_cost * tc_eq
+
+    # 计算组合收益（使用滞后一期的权重）
     lag_csn = w_csn.shift(1).bfill()
     lag_mv = w_mv.shift(1).bfill()
     lag_eq = w_eq.shift(1).bfill()
@@ -694,10 +728,6 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     gross_csn = (returns_df * lag_csn).sum(axis=1)
     gross_mv = (returns_df * lag_mv).sum(axis=1)
     gross_eq = (returns_df * lag_eq).sum(axis=1)
-
-    tc_csn = cfg.transaction_cost * w_csn.diff().abs().sum(axis=1).fillna(0.0)
-    tc_mv = cfg.transaction_cost * w_mv.diff().abs().sum(axis=1).fillna(0.0)
-    tc_eq = cfg.transaction_cost * w_eq.diff().abs().sum(axis=1).fillna(0.0)
 
     net_csn = gross_csn - tc_csn
     net_mv = gross_mv - tc_mv
