@@ -35,16 +35,16 @@ except ImportError:
 # ============================================================
 @dataclass
 class Config:
-    # 数据（仅保留Baostock支持的真实指数）
+    # 数据
     data_mode: str = "SH50"  # 可选：SH50(上证50), CSI300(沪深300), CSI500(中证500)
-    n_assets: int = 50
-    start_date: str = "2015-01-01"
+    n_assets: int = 20
+    start_date: str = "2022-01-01"
     end_date: str = "2024-12-31"
     random_seed: int = 42
 
     # 回测参数
-    train_window_months: int = 12
-    rebalance_freq: str = "M"
+    train_window_months: int = 3
+    rebalance_freq: str = "ME"
     transaction_cost: float = 0.003
     risk_aversion: float = 0.4
     risk_free_annual: float = 0.025
@@ -63,8 +63,8 @@ class Config:
     objective_scale: float = 252.0
 
     # CSN-HMC 采样参数
-    n_samples: int = 400
-    n_burnin: int = 200
+    n_samples: int = 200
+    n_burnin: int = 100
     n_chains: int = 2
     target_accept: float = 0.40
     initial_step_size: float = 0.8
@@ -173,8 +173,47 @@ def get_stock_name_mapping(index_df: pd.DataFrame) -> Dict[str, str]:
     return dict(zip(index_df["code"], index_df["name"]))
 
 # ============================================================
-# 真实行情数据获取（akshare东方财富优先）
+# 真实行情数据获取（新浪财经API）
 # ============================================================
+def get_stock_data_sina(code: str, start: str, end: str) -> pd.DataFrame:
+    """使用新浪财经API获取单只股票历史数据"""
+    import urllib.request
+    import json
+    import time
+    
+    for attempt in range(2):
+        try:
+            url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData"
+            url += f"?symbol={code}&scale=240&ma=no&datalen=1000"
+            
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://finance.sina.com.cn'
+            })
+            
+            response = urllib.request.urlopen(req, timeout=30)
+            data = response.read().decode('utf-8')
+            
+            if data and data.startswith('['):
+                klines = json.loads(data)
+                
+                df = pd.DataFrame(klines)
+                df['day'] = pd.to_datetime(df['day'])
+                df = df.set_index('day')
+                df = df.astype(float)
+                
+                df = df[(df.index >= start) & (df.index <= end)]
+                
+                if len(df) > 0:
+                    time.sleep(0.15)
+                    return df
+            
+            time.sleep(0.3)
+        except Exception:
+            time.sleep(0.5)
+    
+    return pd.DataFrame()
+
 def get_stock_data_akshare(code: str, start: str, end: str) -> pd.DataFrame:
     """使用akshare获取单只股票历史数据"""
     try:
@@ -244,7 +283,7 @@ def get_stock_data_fallback(code: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 def get_market_data(index_df: pd.DataFrame, start: str, end: str) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """获取多只股票的市场数据（优先使用akshare）"""
+    """获取多只股票的市场数据（优先使用新浪财经API）"""
     if index_df.empty:
         raise ValueError("指数成分股数据为空，无法获取行情。")
     
@@ -255,18 +294,29 @@ def get_market_data(index_df: pd.DataFrame, start: str, end: str) -> Tuple[pd.Da
     
     price_df = pd.DataFrame()
     success_count = 0
+    sina_success = 0
+    ak_success = 0
+    fallback_count = 0
     
     for code in tqdm(tickers, desc="行情数据下载进度"):
         df = pd.DataFrame()
         
-        if AKSHARE_AVAILABLE:
+        # 优先使用新浪财经API
+        df = get_stock_data_sina(code, start, end)
+        if not df.empty:
+            sina_success += 1
+        elif AKSHARE_AVAILABLE:
             df = get_stock_data_akshare(code, start, end)
+            if not df.empty:
+                ak_success += 1
         
         if df.empty and BAOSTOCK_AVAILABLE:
             df = get_stock_data_baostock(code, start, end)
         
         if df.empty:
             df = get_stock_data_fallback(code, start, end)
+            if not df.empty:
+                fallback_count += 1
         
         if not df.empty:
             price_df[code] = df["close"]
@@ -283,12 +333,34 @@ def get_market_data(index_df: pd.DataFrame, start: str, end: str) -> Tuple[pd.Da
     valid_codes = returns.columns.tolist()
     name_map = {k: v for k, v in name_map.items() if k in valid_codes}
     
-    data_source = "akshare(东方财富)" if AKSHARE_AVAILABLE else "备用模拟"
-    print(f"数据获取完成（来源: {data_source}）：{len(returns)} 个交易日，{returns.shape[1]} 只有效资产。")
+    print(f"\n数据获取统计：")
+    print(f"  - 新浪财经: {sina_success} 只")
+    print(f"  - akshare: {ak_success} 只")
+    print(f"  - 备用模拟: {fallback_count} 只")
+    print(f"数据获取完成：{len(returns)} 个交易日，{returns.shape[1]} 只有效资产。")
     return returns, name_map
 
 def get_data(cfg: Config) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """获取市场数据"""
+    cached_file = "real_stock_returns.csv"
+    if os.path.exists(cached_file):
+        print(f"\n发现缓存的真实数据文件: {cached_file}")
+        print("使用已缓存数据，跳过API下载...")
+        try:
+            returns = pd.read_csv(cached_file, index_col=0, parse_dates=True)
+            returns = returns.dropna(how='all')
+            returns = returns[(returns.index >= cfg.start_date) & (returns.index <= cfg.end_date)]
+            returns.columns = [c.replace('sh', '').replace('sz', '') for c in returns.columns]
+            returns = returns.loc[:, ~returns.columns.duplicated()]
+            name_map = {}
+            for col in returns.columns:
+                name = STOCK_NAMES.get(col, col)
+                name_map[col] = name
+            print(f"已加载 {len(returns)} 个交易日, {returns.shape[1]} 只股票")
+            return returns, name_map
+        except Exception as e:
+            print(f"加载缓存数据失败: {e}，将重新下载")
+    
     index_df = get_index_constituents(cfg.data_mode)
     cfg.n_assets = len(index_df)
     return get_market_data(index_df, cfg.start_date, cfg.end_date)
@@ -780,10 +852,14 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
             df.iloc[:, :] = equal_weight_portfolio(d)
 
     # 构建用于计算交易成本的权重序列（仅包含调仓日的权重变化）
-    # 首先提取调仓日的权重
-    rebalance_weight_csn = w_csn.loc[rebalance_dates].dropna(how='all')
-    rebalance_weight_mv = w_mv.loc[rebalance_dates].dropna(how='all')
-    rebalance_weight_eq = w_eq.loc[rebalance_dates].dropna(how='all')
+    # 首先提取调仓日的权重（使用 asof 获取最近的可交易日期）
+    valid_rebalance_dates = [d for d in rebalance_dates if d in w_csn.index]
+    if len(valid_rebalance_dates) == 0:
+        valid_rebalance_dates = [w_csn.index.asof(d) for d in rebalance_dates if pd.notna(w_csn.index.asof(d))]
+    
+    rebalance_weight_csn = w_csn.loc[valid_rebalance_dates].dropna(how='all')
+    rebalance_weight_mv = w_mv.loc[valid_rebalance_dates].dropna(how='all')
+    rebalance_weight_eq = w_eq.loc[valid_rebalance_dates].dropna(how='all')
     
     # 计算调仓日的权重变化
     # 换手率 = 0.5 × |w_new - w_old| 的绝对值之和
@@ -796,9 +872,10 @@ def rolling_backtest(returns_df: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFram
     turnover_mv = pd.Series(0.0, index=dates)
     turnover_eq = pd.Series(0.0, index=dates)
     
-    for idx, date in enumerate(rebalance_dates):
+    valid_dates_for_loop = [d for d in valid_rebalance_dates if d in dates]
+    for idx, date in enumerate(valid_dates_for_loop):
         if idx == 0:
-            continue  # 第一个调仓日没有前序权重，不计算交易成本
+            continue
         next_pos = _next_trading_position(dates, date)
         if next_pos < len(dates):
             next_date = dates[next_pos]
@@ -865,7 +942,7 @@ def summarize_results(dailies: Dict[str, pd.Series], curves: Dict[str, pd.Series
     return pd.DataFrame(rows).T
 
 def annual_turnover_rate(weights: pd.DataFrame) -> float:
-    monthly_weights = weights.resample("M").last()
+    monthly_weights = weights.resample("ME").last()
     monthly_changes = monthly_weights.diff().abs().sum(axis=1).dropna()
     avg_monthly_turnover = monthly_changes.mean()
     return float(avg_monthly_turnover * 12 * 100)
@@ -883,7 +960,7 @@ def print_tables(summary: pd.DataFrame, diag_df: pd.DataFrame, weight_df: pd.Dat
     out.loc["MV", "年化换手率(%)"] = annual_turnover_rate(weight_df[[c for c in weight_df.columns if c.startswith("MV_")]])
     out.loc["EW", "年化换手率(%)"] = annual_turnover_rate(weight_df[[c for c in weight_df.columns if c.startswith("EW_")]])
     display_cols = ["年化收益率", "年化波动率", "年化夏普", "年化索提诺", "最大回撤", "卡玛比率", "期末净值", "年化换手率(%)"]
-    print(out[display_cols].applymap(lambda x: f"{x:.4f}" if isinstance(x, (float, np.floating)) and np.isfinite(x) else x))
+    print(out[display_cols].map(lambda x: f"{x:.4f}" if isinstance(x, (float, np.floating)) and np.isfinite(x) else x))
 
     print("\n===== CSN-HMC 采样诊断总表（前5行） =====")
     show_cols = [c for c in ["accept_rate_mean", "final_step_size", "rhat_mean", "ess_mean", "ess_min", "csn_herfindahl", "mv_herfindahl"] if c in diag_df.columns]
@@ -1004,7 +1081,7 @@ def interactive_config() -> Config:
     show_backtest = input("是否修改回测核心参数? (y/n) [默认: n]: ").strip().lower()
     if show_backtest == 'y':
         cfg.train_window_months = int(input(f"训练窗口月数 [默认: {cfg.train_window_months}]: ") or cfg.train_window_months)
-        cfg.rebalance_freq = input(f"调仓频率 (M=月, W=周, D=日) [默认: {cfg.rebalance_freq}]: ") or cfg.rebalance_freq
+        cfg.rebalance_freq = input(f"调仓频率 (ME=月末, W=周末, D=日) [默认: {cfg.rebalance_freq}]: ") or cfg.rebalance_freq
         cfg.transaction_cost = float(input(f"双边交易成本 (如0.003=千三) [默认: {cfg.transaction_cost}]: ") or cfg.transaction_cost)
         cfg.risk_aversion = float(input(f"风险厌恶系数 (越小越激进) [默认: {cfg.risk_aversion}]: ") or cfg.risk_aversion)
         cfg.max_single_weight = float(input(f"单只个股权重上限 [默认: {cfg.max_single_weight}]: ") or cfg.max_single_weight)
